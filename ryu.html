@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="ro">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ryu</title>
+<style>
+  :root{--bg:#0b0f14;--fg:#e8eef5;--ac:#3ddc97;--mut:#7d8a99}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,sans-serif;display:flex;flex-direction:column;align-items:center;min-height:100vh;padding:16px;gap:14px}
+  h1{margin:8px 0 0;font-size:28px;letter-spacing:2px}
+  #orb{width:150px;height:150px;border-radius:50%;background:radial-gradient(circle at 30% 30%,#6fffc0,#0e7a52);box-shadow:0 0 40px #3ddc9755;transition:.3s;border:0;color:#04130c;font-size:18px;font-weight:700}
+  #orb.listening{box-shadow:0 0 70px #3ddc97;transform:scale(1.08)}
+  #orb.busy{background:radial-gradient(circle at 30% 30%,#ffd37a,#b36b00);box-shadow:0 0 50px #ffb54a88}
+  #status{color:var(--mut);min-height:22px;text-align:center}
+  #log{width:100%;max-width:520px;background:#121923;border-radius:12px;padding:12px;min-height:90px;font-size:15px;line-height:1.4}
+  #log p{margin:4px 0}.u{color:var(--ac)}.r{color:var(--fg)}
+  #yt{width:100%;max-width:520px;aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:#000}
+  details{width:100%;max-width:520px;background:#121923;border-radius:12px;padding:10px}
+  input{width:100%;margin:6px 0 10px;padding:10px;border-radius:8px;border:1px solid #263244;background:#0b0f14;color:var(--fg)}
+  label{font-size:13px;color:var(--mut)}
+  button.s{padding:10px 16px;border-radius:8px;border:0;background:var(--ac);color:#04130c;font-weight:700}
+</style>
+</head>
+<body>
+<h1>RYU</h1>
+<button id="orb">Pornește</button>
+<div id="status">Apasă butonul ca să începi.</div>
+<div id="yt"><div id="player"></div></div>
+<div id="log"></div>
+
+<details>
+<summary>Setări</summary>
+<label>Cheie API Claude (obligatoriu)</label>
+<input id="ak" type="password" placeholder="sk-ant-...">
+<label>Cheie YouTube Data API (pentru căutarea muzicii)</label>
+<input id="yk" type="password" placeholder="AIza...">
+<label>URL pentru aer condiționat (opțional, ex. ESP32: http://192.168.4.1)</label>
+<input id="acurl" placeholder="http://...">
+<button class="s" id="save">Salvează</button>
+</details>
+
+<script>
+const $ = id => document.getElementById(id);
+const store = {get:k=>{try{return localStorage.getItem(k)||""}catch(e){return ""}},set:(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}}};
+["ak","yk","acurl"].forEach(k=>$(k).value=store.get(k));
+$("save").onclick=()=>{["ak","yk","acurl"].forEach(k=>store.set(k,$(k).value.trim()));say("Setările au fost salvate.")};
+
+const WAKE=/\b(ryu|riu|riyu|rio|raiu|ryo|ru)\b/i;
+const MODEL="claude-haiku-5-5";
+const SYS=`Ești Ryu, asistentul vocal dintr-un VW Golf 4. Utilizatorul îți vorbește în română, prin recunoaștere vocală (pot apărea greșeli de transcriere). Răspunde DOAR cu un obiect JSON, fără alt text:
+{"action":"play|pause|resume|next|prev|volume_up|volume_down|joke|ac|chat","query":"...","state":"on|off","reply":"..."}
+- play: query = melodia/artistul de căutat pe YouTube Music; reply = confirmare foarte scurtă.
+- joke: reply = o glumă scurtă, nouă, în română, bună de spus cu voce tare.
+- ac: state = on sau off; reply = confirmare scurtă.
+- chat: reply = răspuns scurt (max 2 propoziții), fără emoji sau markdown.
+Fii scurt: șoferul conduce.`;
+
+let rec, awaiting=false, speaking=false, running=false, player, queue=[], qi=0, vol=80;
+
+function log(cls,t){const p=document.createElement("p");p.className=cls;p.textContent=t;$("log").prepend(p)}
+function status(t,mode){$("status").textContent=t;$("orb").className=mode||""}
+
+// --- YouTube player ---
+const tag=document.createElement("script");tag.src="https://www.youtube.com/iframe_api";document.head.appendChild(tag);
+window.onYouTubeIframeAPIReady=()=>{player=new YT.Player("player",{width:"100%",height:"100%",playerVars:{playsinline:1},events:{onStateChange:e=>{if(e.data===0)next()}}})};
+function playIdx(i){if(!queue.length||!player)return;qi=(i+queue.length)%queue.length;player.loadVideoById(queue[qi]);player.setVolume(vol)}
+function next(){playIdx(qi+1)}
+
+async function searchYT(q){
+  const key=store.get("yk");if(!key)throw new Error("Lipsește cheia YouTube din setări.");
+  const u="https://www.googleapis.com/youtube/v3/search?part=snippet&type=video&videoEmbeddable=true&videoCategoryId=10&maxResults=10&q="+encodeURIComponent(q)+"&key="+key;
+  const r=await fetch(u);const j=await r.json();
+  if(!j.items||!j.items.length)throw new Error("Nu am găsit nimic.");
+  return j.items.map(x=>x.id.videoId);
+}
+
+// --- Voce ---
+function say(t){
+  return new Promise(res=>{
+    log("r","Ryu: "+t);
+    try{rec&&rec.stop()}catch(e){}
+    speaking=true;
+    const u=new SpeechSynthesisUtterance(t);u.lang="ro-RO";u.rate=1.05;
+    u.onend=u.onerror=()=>{speaking=false;res();startRec()};
+    speechSynthesis.cancel();speechSynthesis.speak(u);
+  });
+}
+
+// --- Claude ---
+async function ask(cmd){
+  const key=store.get("ak");if(!key)throw new Error("Lipsește cheia API Claude din setări.");
+  const r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{
+    "content-type":"application/json","x-api-key":key,"anthropic-version":"2023-06-01",
+    "anthropic-dangerous-direct-browser-access":"true"},
+    body:JSON.stringify({model:MODEL,max_tokens:300,system:SYS,messages:[{role:"user",content:cmd}]})});
+  const j=await r.json();
+  if(!r.ok)throw new Error(j.error?.message||"Eroare API");
+  const m=j.content[0].text.match(/\{[\s\S]*\}/);
+  return JSON.parse(m[0]);
+}
+
+async function run(cmd){
+  log("u","Tu: "+cmd);status("Mă gândesc...","busy");
+  if(player&&player.setVolume)player.setVolume(15);
+  try{
+    const a=await ask(cmd);
+    switch(a.action){
+      case "play":
+        queue=await searchYT(a.query);qi=0;playIdx(0);vol=80;await say(a.reply||"Pornesc muzica.");return;
+      case "pause": player&&player.pauseVideo();break;
+      case "resume": player&&player.playVideo();break;
+      case "next": next();break;
+      case "prev": playIdx(qi-1);break;
+      case "volume_up": vol=Math.min(100,vol+20);break;
+      case "volume_down": vol=Math.max(10,vol-20);break;
+      case "ac": {
+        const url=store.get("acurl");
+        if(!url){await say("Aerul condiționat nu e conectat încă la mine.");return}
+        try{await fetch(url.replace(/\/$/,"")+"/ac/"+(a.state==="off"?"off":"on"),{mode:"no-cors"})}
+        catch(e){await say("Nu am reușit să ajung la aerul condiționat.");return}
+        break;}
+    }
+    if(player&&player.setVolume)player.setVolume(vol);
+    await say(a.reply||"Gata.");
+  }catch(e){
+    if(player&&player.setVolume)player.setVolume(vol);
+    await say(e.message||"Ceva n-a mers.");
+  }
+}
+
+// --- Ascultare permanentă ---
+function startRec(){
+  if(!running||speaking)return;
+  const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
+  if(!SR){status("Browserul nu suportă recunoaștere vocală. Folosește Chrome.");return}
+  rec=new SR();rec.lang="ro-RO";rec.continuous=true;rec.interimResults=false;
+  rec.onresult=e=>{
+    for(let i=e.resultIndex;i<e.results.length;i++){
+      if(!e.results[i].isFinal)continue;
+      const t=e.results[i][0].transcript.trim();if(!t)continue;
+      const m=t.match(WAKE);
+      if(m){
+        const cmd=t.slice(m.index+m[0].length).replace(/^[\s,.!?]+/,"");
+        if(cmd.length>2){awaiting=false;run(cmd)}
+        else{awaiting=true;if(player&&player.setVolume)player.setVolume(15);say("Da?")}
+      }else if(awaiting){awaiting=false;run(t)}
+    }
+  };
+  rec.onend=()=>{if(running&&!speaking)setTimeout(startRec,250)};
+  rec.onerror=e=>{if(e.error==="not-allowed")status("Microfonul e blocat. Permite-l din setările Chrome.")};
+  try{rec.start();status("Ascult... spune „Ryu”","listening")}catch(e){}
+}
+
+$("orb").onclick=async()=>{
+  if(running){running=false;try{rec.stop()}catch(e){}status("Oprit.");$("orb").textContent="Pornește";$("orb").className="";return}
+  running=true;$("orb").textContent="Oprește";
+  try{await navigator.mediaDevices.getUserMedia({audio:true})}catch(e){status("Am nevoie de acces la microfon.");running=false;return}
+  try{await navigator.wakeLock.request("screen")}catch(e){}
+  await say("Salut, sunt Ryu. Spune-mi ce vrei.");
+};
+</script>
+</body>
+</html>
